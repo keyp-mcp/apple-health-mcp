@@ -1,6 +1,32 @@
 import type { HealthDataDB } from './database';
 import type { FileCatalog } from './catalog';
 
+export interface TableSelectParts {
+  unitSelect: string;
+  tzSelect: string;
+  valueSelect: string;
+  whereClause: string;
+}
+
+/**
+ * Build SQL fragments based on available columns and table type.
+ * columnNames should be lowercase.
+ */
+export function buildTableSelectParts(columnNames: string[], tableName: string): TableSelectParts {
+  const hasUnit = columnNames.includes('unit');
+  const hasHKTimeZone = columnNames.includes('hktimezone');
+  const isCategory = tableName.includes('categorytypeidentifier');
+
+  return {
+    unitSelect: hasUnit ? 'unit,' : 'NULL AS unit,',
+    tzSelect: hasHKTimeZone ? ', HKTimeZone' : '',
+    valueSelect: isCategory
+      ? 'CAST(value AS VARCHAR) as value'
+      : 'TRY_CAST(value AS DOUBLE) as value',
+    whereClause: 'WHERE value IS NOT NULL',
+  };
+}
+
 export class TableLoader {
   private db: HealthDataDB;
   private catalog: FileCatalog;
@@ -79,21 +105,29 @@ export class TableLoader {
     // Drop existing table if it exists
     await this.db.run(`DROP TABLE IF EXISTS ${finalTable}`);
     
+    // Detect available columns and build SQL fragments
+    const columns = await this.db.execute(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = '${stagingTable}'`
+    );
+    const columnNames = columns.map((c: any) => c.column_name?.toLowerCase());
+    const { unitSelect, tzSelect, valueSelect, whereClause } = buildTableSelectParts(columnNames, finalTable);
+
     // Create optimized table with proper types and indexes
     await this.db.run(`
       CREATE TABLE ${finalTable} AS
-      SELECT 
+      SELECT
         type,
         sourceName,
         sourceVersion,
-        unit,
+        ${unitSelect}
         TRY_CAST(SUBSTR(startDate, 1, 19) AS TIMESTAMP) as startDate,
         TRY_CAST(SUBSTR(endDate, 1, 19) AS TIMESTAMP) as endDate,
-        TRY_CAST(value AS DOUBLE) as value,
+        ${valueSelect},
         device,
         productType
+        ${tzSelect}
       FROM ${stagingTable}
-      WHERE value IS NOT NULL
+      ${whereClause}
     `);
     
     // Create indexes for common query patterns

@@ -1,5 +1,6 @@
 import type { HealthDataDB } from '../db/database';
 import type { FileCatalog } from '../db/catalog';
+import { buildTableSelectParts } from '../db/loader';
 
 export class HealthSchemaTool {
   private db: HealthDataDB;
@@ -48,24 +49,26 @@ export class HealthSchemaTool {
     // Get schema information for sample tables
     for (const tableName of sampleTables) {
       try {
-        // Ensure table is loaded
         const entry = this.catalog.getEntry(tableName);
-        if (!entry?.loaded) {
-          // Load a small sample to get schema
+        // Use a preview table if not already fully loaded
+        const needsPreview = !entry?.loaded;
+        const queryTable = needsPreview ? `${tableName}_preview` : tableName;
+
+        if (needsPreview) {
           await this.loadTableSample(tableName, entry!.path);
         }
-        
+
         // Get column information
         const columns = await this.db.execute(`
-          SELECT column_name, data_type 
-          FROM information_schema.columns 
-          WHERE table_name = '${tableName}'
+          SELECT column_name, data_type
+          FROM information_schema.columns
+          WHERE table_name = '${queryTable}'
           ORDER BY ordinal_position
         `);
-        
+
         // Get sample data
         const sampleData = await this.db.execute(`
-          SELECT * FROM ${tableName}
+          SELECT * FROM ${queryTable}
           ORDER BY startDate DESC
           LIMIT 3
         `);
@@ -73,23 +76,33 @@ export class HealthSchemaTool {
         // Get distinct units for this table (sorted by frequency)
         const unitInfo = await this.db.execute(`
           SELECT unit, COUNT(*) as count
-          FROM ${tableName}
+          FROM ${queryTable}
           WHERE unit IS NOT NULL
           GROUP BY unit
           ORDER BY count DESC
         `);
-        
-        // Get data statistics
+
+        // Get data statistics from source CSV for accurate counts
+        // (the loaded table may only be a sample)
         const stats = await this.db.execute(`
-          SELECT 
+          SELECT
             COUNT(*) as total_rows,
-            MIN(DATE(startDate)) as earliest_date,
-            MAX(DATE(startDate)) as latest_date,
-            COUNT(DISTINCT DATE(startDate)) as unique_dates
-          FROM ${tableName}
+            MIN(DATE(TRY_CAST(SUBSTR(startDate, 1, 19) AS TIMESTAMP))) as earliest_date,
+            MAX(DATE(TRY_CAST(SUBSTR(startDate, 1, 19) AS TIMESTAMP))) as latest_date,
+            COUNT(DISTINCT DATE(TRY_CAST(SUBSTR(startDate, 1, 19) AS TIMESTAMP))) as unique_dates
+          FROM read_csv('${entry!.path}',
+            header = true,
+            skip = 1,
+            delim = ',',
+            quote = '"',
+            escape = '"',
+            ignore_errors = true,
+            null_padding = true,
+            new_line = '\\r\\n'
+          )
           WHERE startDate IS NOT NULL
         `);
-        
+
         schema.tableDetails[tableName] = {
           columns: columns.map((col: any) => ({
             name: col.column_name,
@@ -97,11 +110,18 @@ export class HealthSchemaTool {
           })),
           units: unitInfo.map((u: any) => u.unit),
           primaryUnit: unitInfo[0]?.unit || 'unknown',
-          sampleRows: sampleData.slice(0, 2), // Show only 2 rows to keep response manageable
+          sampleRows: sampleData.slice(0, 2),
           statistics: stats[0] || {}
         };
-        
+
+        // Clean up preview table so it doesn't linger
+        if (needsPreview) {
+          await this.db.run(`DROP TABLE IF EXISTS ${queryTable}`);
+        }
+
       } catch (error) {
+        // Clean up preview table on error too
+        await this.db.run(`DROP TABLE IF EXISTS ${tableName}_preview`);
         schema.tableDetails[tableName] = {
           error: `Failed to load table: ${error}`,
           available: false
@@ -141,12 +161,16 @@ export class HealthSchemaTool {
   }
   
   private async loadTableSample(tableName: string, filePath: string): Promise<void> {
-    const tempTableName = `${tableName}_sample`;
-    
+    const stagingTable = `${tableName}_sample`;
+    const previewTable = `${tableName}_preview`;
+
     try {
+      await this.db.run(`DROP TABLE IF EXISTS ${stagingTable}`);
+      await this.db.run(`DROP TABLE IF EXISTS ${previewTable}`);
+
       // Load just a few rows to get schema
       await this.db.run(`
-        CREATE TABLE ${tempTableName} AS
+        CREATE TABLE ${stagingTable} AS
         SELECT * FROM read_csv('${filePath}',
           header = true,
           skip = 1,
@@ -159,33 +183,39 @@ export class HealthSchemaTool {
         )
         LIMIT 100
       `);
-      
-      // Clean up timestamps and create final table
+
+      // Detect columns and build SQL fragments
+      const columns = await this.db.execute(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = '${stagingTable}'`
+      );
+      const columnNames = columns.map((c: any) => c.column_name?.toLowerCase());
+      const { unitSelect, tzSelect, valueSelect, whereClause } = buildTableSelectParts(columnNames, tableName);
+
+      // Clean up timestamps and create preview table (NOT the real table name)
       await this.db.run(`
-        CREATE TABLE ${tableName} AS
-        SELECT 
+        CREATE TABLE ${previewTable} AS
+        SELECT
           type,
           sourceName,
           sourceVersion,
-          unit,
+          ${unitSelect}
           TRY_CAST(SUBSTR(startDate, 1, 19) AS TIMESTAMP) as startDate,
           TRY_CAST(SUBSTR(endDate, 1, 19) AS TIMESTAMP) as endDate,
-          TRY_CAST(value AS DOUBLE) as value,
+          ${valueSelect},
           device,
           productType
-        FROM ${tempTableName}
-        WHERE value IS NOT NULL
+          ${tzSelect}
+        FROM ${stagingTable}
+        ${whereClause}
       `);
-      
-      // Clean up
-      await this.db.run(`DROP TABLE ${tempTableName}`);
-      
-      // Mark as loaded in catalog
-      this.catalog.markLoaded(tableName, 100); // Approximate count
-      
+
+      // Clean up staging table
+      await this.db.run(`DROP TABLE ${stagingTable}`);
+
     } catch (error) {
       // Clean up on error
-      await this.db.run(`DROP TABLE IF EXISTS ${tempTableName}`);
+      await this.db.run(`DROP TABLE IF EXISTS ${stagingTable}`);
+      await this.db.run(`DROP TABLE IF EXISTS ${previewTable}`);
       throw error;
     }
   }
